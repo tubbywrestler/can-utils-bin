@@ -12,7 +12,7 @@ provides=('can-utils')
 conflicts=('can-utils' 'can-utils-git')
 
 source=("https://github.com/tubbywrestler/can-utils-bin/releases/download/${pkgver}-${_pkgrel_src}/can-utils-${pkgver}-${_pkgrel_src}-x86_64.pkg.tar.zst")
-sha256sums=('SKIP')
+sha256sums=('1b18a0f421076a880f49aacbcdaf169e9d3490b979824320eb001295712be683')
 
 package() {
     bsdtar -xf "${srcdir}/can-utils-${pkgver}-${_pkgrel_src}-x86_64.pkg.tar.zst" -C "${pkgdir}" --exclude .PKGINFO --exclude .BUILDINFO --exclude .MTREE

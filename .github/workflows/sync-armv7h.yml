@@ -59,26 +59,50 @@ jobs:
       - name: Bootstrap git and GitHub CLI
         run: |
           pacman -Syu --noconfirm
-          pacman -S --noconfirm --needed git github-cli cmake ninja
-
-      - name: Install the arm-linux-gnueabihf-*-bin cross toolchain
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir /tmp/toolchain && cd /tmp/toolchain
-          for pkg in glibc-headers binutils glibc gcc; do
-            gh release download --repo "tubbywrestler/arm-linux-gnueabihf-${pkg}-bin" --pattern '*.pkg.tar.zst' --clobber
-          done
-          pacman -U --noconfirm ./arm-linux-gnueabihf-glibc-headers-bin-*.pkg.tar.zst \
-                                 ./arm-linux-gnueabihf-binutils-bin-*.pkg.tar.zst \
-                                 ./arm-linux-gnueabihf-glibc-bin-*.pkg.tar.zst \
-                                 ./arm-linux-gnueabihf-gcc-bin-*.pkg.tar.zst
-          arm-linux-gnueabihf-gcc --version | head -1
+          pacman -S --noconfirm --needed git github-cli sudo cmake ninja
 
       - name: Create unprivileged build user
         run: |
+          # Needed before dependency resolution now, not just before the build -
+          # both the AUR helper bootstrap and makepkg itself refuse to run as root.
+          # NOPASSWD sudo is fine here only because this container is destroyed
+          # at the end of the run.
           useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
           chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Bootstrap AUR helper (yay)
+        run: |
+          su builder -c '
+            cd ~
+            git clone -q https://aur.archlinux.org/yay-bin.git
+            cd yay-bin
+            makepkg -si --noconfirm
+          '
+
+      - name: Install the arm-linux-gnueabihf-*-bin cross toolchain
+        run: |
+          # These are AUR packages - install them the same way any real AUR user
+          # would (via an AUR helper resolving against aur.archlinux.org), not by
+          # reaching into their GitHub repos' own release artifacts. That GitHub
+          # state can be ahead of what's actually committed to AUR (it was, for
+          # this exact set of packages), which would mean building against
+          # something nobody else installing from AUR could actually get.
+          #
+          # Real, build-from-source arm-linux-gnueabihf-{gcc,binutils,glibc,
+          # glibc-headers} packages also exist on AUR, and these -bin packages'
+          # own depends=() reference those same plain names. yay resolves an AUR
+          # dependency by exact name first, only falling back to a provides-based
+          # search if no exact-name package exists - so asking for gcc-bin cold
+          # would have yay build the real (slow, from-source) binutils/glibc
+          # rather than use these already-installed -bin siblings. Installing
+          # leaf-to-root means each later package's depends are already locally
+          # satisfied by the time pacman checks them, so yay never needs to
+          # resolve them from AUR at all (same fix already used for scalapack-bin).
+          su builder -c 'yay -S --noconfirm --needed arm-linux-gnueabihf-glibc-headers-bin'
+          su builder -c 'yay -S --noconfirm --needed arm-linux-gnueabihf-binutils-bin arm-linux-gnueabihf-glibc-bin'
+          su builder -c 'yay -S --noconfirm --needed arm-linux-gnueabihf-gcc-bin'
+          arm-linux-gnueabihf-gcc --version | head -1
 
       - name: Checkout this repo
         uses: actions/checkout@v7

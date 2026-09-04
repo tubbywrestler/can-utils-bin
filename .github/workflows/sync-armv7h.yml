@@ -31,16 +31,23 @@ jobs:
           echo "pkgver=$pkgver" >> "$GITHUB_OUTPUT"
           echo "pkgrel=$pkgrel" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "tag=${pkgver}-${pkgrel}-armv7h" >> "$GITHUB_OUTPUT"
+          # Same tag as the x86_64 side (via aur-bin-chicken) uses for this repo -
+          # one GitHub release per upstream version, with both architectures'
+          # assets attached to it (distinguished by filename, not by tag), so
+          # anyone looking at "Latest" sees both, not just whichever side built
+          # most recently.
+          echo "tag=${pkgver}-${pkgrel}" >> "$GITHUB_OUTPUT"
 
-      # -armv7h suffix keeps this tag from ever colliding with the x86_64
-      # side's own ${pkgver}-${pkgrel} release tag on this same repo.
       - name: Check whether this version is already released
         id: exists
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "${{ steps.upstream.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+          artifact="can-utils-${{ steps.upstream.outputs.pkgver }}-${{ steps.upstream.outputs.pkgrel }}-armv7h.tar.zst"
+          # The release for this tag may already exist (created by the x86_64
+          # side) without the armv7h asset yet - idempotency here is "does OUR
+          # asset exist", not "does the release exist".
+          if gh release view "${{ steps.upstream.outputs.tag }}" --repo "${{ github.repository }}" --json assets --jq '.assets[].name' 2>/dev/null | grep -qx "$artifact"; then
             echo "is_new=false" >> "$GITHUB_OUTPUT"
           else
             echo "is_new=true" >> "$GITHUB_OUTPUT"
@@ -150,10 +157,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd bin-repo
-          gh release create "${{ needs.check.outputs.tag }}" "${{ steps.pkg.outputs.artifact }}" \
-            --repo "${{ github.repository }}" \
-            --title "${{ needs.check.outputs.tag }}" \
-            --notes "Cross-compiled can-utils ${{ needs.check.outputs.pkgver }}-${{ needs.check.outputs.pkgrel }} for armv7h (BeagleBone Black), built with arm-linux-gnueabihf-*-bin"
+          tag="${{ needs.check.outputs.tag }}"
+          # The release for this tag may already exist (created by the x86_64
+          # side via aur-bin-chicken) - upload into it rather than failing on
+          # "already exists"; only create it fresh if this is genuinely the
+          # first asset published for this version.
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$tag" "${{ steps.pkg.outputs.artifact }}" --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$tag" "${{ steps.pkg.outputs.artifact }}" \
+              --repo "${{ github.repository }}" \
+              --title "$tag" \
+              --notes "Automated build of can-utils ${{ needs.check.outputs.pkgver }}-${{ needs.check.outputs.pkgrel }}"
+          fi
 
       - name: Bump bin package PKGBUILD (armv7h fields only)
         env:

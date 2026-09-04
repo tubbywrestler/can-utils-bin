@@ -1,0 +1,177 @@
+name: Sync can-utils (armv7h cross-build)
+
+on:
+  schedule:
+    - cron: '43 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      pkgver: ${{ steps.upstream.outputs.pkgver }}
+      pkgrel: ${{ steps.upstream.outputs.pkgrel }}
+      commit: ${{ steps.upstream.outputs.commit }}
+      tag: ${{ steps.upstream.outputs.tag }}
+      is_new: ${{ steps.exists.outputs.is_new }}
+    steps:
+      # Same real can-utils AUR package the x86_64 side (via aur-bin-chicken)
+      # tracks - source it directly rather than grep, since its own source=()
+      # is a shell array, not a plain string.
+      - name: Read upstream can-utils version and pinned commit
+        id: upstream
+        run: |
+          git clone --depth 1 https://aur.archlinux.org/can-utils.git aur-src
+          cd aur-src
+          source PKGBUILD
+          commit="${source[0]#*#commit=}"
+          echo "pkgver=$pkgver" >> "$GITHUB_OUTPUT"
+          echo "pkgrel=$pkgrel" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "tag=${pkgver}-${pkgrel}-armv7h" >> "$GITHUB_OUTPUT"
+
+      # -armv7h suffix keeps this tag from ever colliding with the x86_64
+      # side's own ${pkgver}-${pkgrel} release tag on this same repo.
+      - name: Check whether this version is already released
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.upstream.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "is_new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.is_new == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Bootstrap git and GitHub CLI
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed git github-cli cmake ninja
+
+      - name: Install the arm-linux-gnueabihf-*-bin cross toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir /tmp/toolchain && cd /tmp/toolchain
+          for pkg in glibc-headers binutils glibc gcc; do
+            gh release download --repo "tubbywrestler/arm-linux-gnueabihf-${pkg}-bin" --pattern '*.pkg.tar.zst' --clobber
+          done
+          pacman -U --noconfirm ./arm-linux-gnueabihf-glibc-headers-bin-*.pkg.tar.zst \
+                                 ./arm-linux-gnueabihf-binutils-bin-*.pkg.tar.zst \
+                                 ./arm-linux-gnueabihf-glibc-bin-*.pkg.tar.zst \
+                                 ./arm-linux-gnueabihf-gcc-bin-*.pkg.tar.zst
+          arm-linux-gnueabihf-gcc --version | head -1
+
+      - name: Create unprivileged build user
+        run: |
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Checkout this repo
+        uses: actions/checkout@v7
+        with:
+          path: bin-repo
+
+      - name: Cross-compile can-utils
+        env:
+          COMMIT: ${{ needs.check.outputs.commit }}
+        run: |
+          git clone https://github.com/linux-can/can-utils.git /tmp/can-utils-src
+          cd /tmp/can-utils-src
+          git checkout "$COMMIT"
+          cat > /tmp/arm-toolchain.cmake <<'EOF'
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_SYSTEM_PROCESSOR arm)
+          set(CMAKE_C_COMPILER arm-linux-gnueabihf-gcc)
+          set(CMAKE_FIND_ROOT_PATH /usr/arm-none-linux-gnueabihf)
+          set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+          set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+          set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+          EOF
+          mkdir /tmp/build
+          cd /tmp/build
+          cmake -GNinja -DCMAKE_TOOLCHAIN_FILE=/tmp/arm-toolchain.cmake -DCMAKE_INSTALL_PREFIX=/usr /tmp/can-utils-src
+          ninja
+          DESTDIR=/tmp/instroot ninja install
+          file /tmp/instroot/usr/bin/cansend | grep -q "ARM" || { echo "not an ARM binary, aborting"; exit 1; }
+
+      - name: Package as a plain tarball and compute checksum
+        id: pkg
+        env:
+          NEW_PKGVER: ${{ needs.check.outputs.pkgver }}
+          NEW_PKGREL: ${{ needs.check.outputs.pkgrel }}
+        run: |
+          artifact="can-utils-${NEW_PKGVER}-${NEW_PKGREL}-armv7h.tar.zst"
+          tar -C /tmp/instroot --zstd -cf "$artifact" usr
+          sha=$(sha256sum "$artifact" | awk '{print $1}')
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          mv "$artifact" bin-repo/
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd bin-repo
+          gh release create "${{ needs.check.outputs.tag }}" "${{ steps.pkg.outputs.artifact }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ needs.check.outputs.tag }}" \
+            --notes "Cross-compiled can-utils ${{ needs.check.outputs.pkgver }}-${{ needs.check.outputs.pkgrel }} for armv7h (BeagleBone Black), built with arm-linux-gnueabihf-*-bin"
+
+      - name: Bump bin package PKGBUILD (armv7h fields only)
+        env:
+          NEW_PKGVER: ${{ needs.check.outputs.pkgver }}
+          NEW_PKGREL_SRC: ${{ needs.check.outputs.pkgrel }}
+          SHA: ${{ steps.pkg.outputs.sha }}
+        run: |
+          cd bin-repo
+          sed -i "s/^pkgver=.*/pkgver=${NEW_PKGVER}/" PKGBUILD
+          sed -i "s/^_pkgrel_src=.*/_pkgrel_src=${NEW_PKGREL_SRC}/" PKGBUILD
+          sed -i -E "s/^(sha256sums_armv7h)=.*/\1=('${SHA}')/" PKGBUILD
+          chmod o+w . PKGBUILD .SRCINFO
+          su builder -c "makepkg --printsrcinfo > .SRCINFO"
+
+      - name: Commit and push bump
+        run: |
+          cd bin-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          if ! git diff --cached --quiet; then
+            git commit -m "${{ needs.check.outputs.tag }}"
+            git push
+          fi
+
+      - name: Update aur branch (flat files only, for AUR push)
+        run: |
+          cd bin-repo
+          if git ls-remote --exit-code --heads origin aur >/dev/null 2>&1; then
+            git fetch origin aur
+            git checkout -B aur origin/aur
+          else
+            git checkout --orphan aur
+            git rm -rf --cached . >/dev/null 2>&1 || true
+            git clean -fdx >/dev/null
+          fi
+          for f in PKGBUILD .SRCINFO .gitignore; do
+            git checkout master -- "$f" 2>/dev/null || true
+          done
+          git add PKGBUILD .SRCINFO .gitignore
+          if ! git diff --cached --quiet; then
+            git commit -m "${{ needs.check.outputs.tag }}"
+            git push origin aur
+          fi
+          git checkout master
